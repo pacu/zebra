@@ -23,8 +23,34 @@ use crate::indexer::{
     NonFinalizedStateChangeRequest,
 };
 
-/// How long to wait between calls to `subscribe_to_non_finalized_state_change` when it returns an error.
+/// How long to wait between subscription attempts in [`update_finalized_chain_tip`] when they
+/// fail. (`sync()`'s own re-subscription delays are governed by [`RESUBSCRIBE_BACKOFF`].)
 const POLL_DELAY: Duration = Duration::from_secs(5);
+
+/// Delays before re-subscribing to `non_finalized_state_change` after a subscription attempt
+/// fails or a stream ends shortly after being established. Escalates one step per consecutive
+/// failure and stays at the final value; reset once a stream survives for
+/// [`STREAM_HEALTHY_DURATION`].
+///
+/// Without a delay, a server that tears the stream down during the initial send (e.g.
+/// <https://github.com/ZcashFoundation/zebra/issues/11265>) turns re-subscription into a
+/// full-speed loop where every iteration makes the server re-walk and re-send its
+/// non-finalized state.
+const RESUBSCRIBE_BACKOFF: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+];
+
+/// How long a `non_finalized_state_change` subscription must stay up for the re-subscription
+/// backoff to reset.
+///
+/// Longevity (not message delivery) is the health signal here: a server that drops the stream
+/// when its listener buffer fills still delivers a partial burst before every drop, which would
+/// defeat a delivery-based reset.
+const STREAM_HEALTHY_DURATION: Duration = Duration::from_secs(60);
 
 /// How long to wait for a message on a gRPC subscription stream before assuming the stream is dead
 /// and re-subscribing.
@@ -71,9 +97,14 @@ pub struct TrustedChainSync {
     chain_tip_sender: ChainTipSender,
     /// The non-finalized state sender, for updating the [`ReadStateService`] when the non-finalized best chain changes.
     non_finalized_state_sender: tokio::sync::watch::Sender<NonFinalizedState>,
-    /// Flipped to `true` once `sync()` receives its first parseable block from the
-    /// `non_finalized_state_change` stream, which stops [`update_finalized_chain_tip`] so `sync()`
-    /// becomes the sole caller of `try_catch_up_with_primary` on the shared secondary db.
+    /// Flipped to `true` once `sync()` commits and publishes its first non-finalized block
+    /// (streamed or fetched), which stops [`update_finalized_chain_tip`] so `sync()` becomes the
+    /// sole caller of `try_catch_up_with_primary` on the shared secondary db.
+    ///
+    /// Flipping on the first successful *commit* (rather than the first received message) keeps
+    /// the finalized-tip fallback alive while the stream fails before any block can be committed
+    /// (e.g. <https://github.com/ZcashFoundation/zebra/issues/11265>), so the published tip keeps
+    /// following the finalized tip instead of freezing.
     started_sync_sender: tokio::sync::watch::Sender<bool>,
 }
 
@@ -86,7 +117,7 @@ async fn update_finalized_chain_tip(
     let mut chain_tip_change_stream = None;
 
     loop {
-        // Stop as soon as `sync()` has received its first parseable non-finalized block. From then
+        // Stop as soon as `sync()` has committed its first non-finalized block. From then
         // on `sync()` is the sole caller of `try_catch_up_with_primary` on the shared secondary, so
         // this task must not advance the secondary's view concurrently (which would let a block be
         // finalized between `sync()`'s check and its commit, failing as a duplicate-effects error).
@@ -228,9 +259,9 @@ impl TrustedChainSync {
         let indexer_rpc_client = IndexerClient::new(channel);
         let finalized_chain_tip_sender = chain_tip_sender.finalized_sender();
 
-        // `sync()` flips this to `true` as soon as it receives its first parseable non-finalized
-        // block, which stops `update_finalized_chain_tip` so `sync()` becomes the sole caller of
-        // `try_catch_up_with_primary` on the shared secondary db.
+        // `sync()` flips this to `true` as soon as it commits and publishes its first
+        // non-finalized block, which stops `update_finalized_chain_tip` so `sync()` becomes the
+        // sole caller of `try_catch_up_with_primary` on the shared secondary db.
         let (started_sync_sender, started_sync_receiver) = tokio::sync::watch::channel(false);
 
         let mut syncer = Self {
@@ -271,8 +302,10 @@ impl TrustedChainSync {
         // The hash of the block that most recently failed to commit, used to avoid re-logging the
         // same warning at full rate while a block persistently fails to commit.
         let mut last_failed_commit_hash = None;
-        // Whether we've signalled `update_finalized_chain_tip` to stop, so we only send once.
-        let mut signalled_started = false;
+        // When the current stream was established, and how many consecutive subscription attempts
+        // failed (or ended before `STREAM_HEALTHY_DURATION`), driving `RESUBSCRIBE_BACKOFF`.
+        let mut stream_subscribed_at: Option<tokio::time::Instant> = None;
+        let mut failed_stream_attempts: usize = 0;
         self.try_catch_up_with_primary().await;
         if let Some(finalized_tip_block) = finalized_chain_tip_block(&self.db).await {
             self.chain_tip_sender.set_finalized_tip(finalized_tip_block);
@@ -280,14 +313,39 @@ impl TrustedChainSync {
 
         loop {
             let Some(ref mut non_finalized_state_change) = non_finalized_blocks_listener else {
+                // A stream that survived for a while was healthy, so its end doesn't count
+                // towards the backoff; only attempts that fail outright or die quickly do.
+                if let Some(subscribed_at) = stream_subscribed_at.take() {
+                    if subscribed_at.elapsed() >= STREAM_HEALTHY_DURATION {
+                        failed_stream_attempts = 0;
+                    }
+                }
+                if failed_stream_attempts > 0 {
+                    let delay = RESUBSCRIBE_BACKOFF
+                        [(failed_stream_attempts - 1).min(RESUBSCRIBE_BACKOFF.len() - 1)];
+                    tokio::time::sleep(delay).await;
+                }
+                failed_stream_attempts = failed_stream_attempts.saturating_add(1);
+
+                // Catch up to the primary's best tip over unary `get_block` calls before
+                // subscribing, so the subscription request carries our actual chain tips and the
+                // server's initial send only covers blocks we don't already have. With an empty
+                // non-finalized state the server would re-send its entire non-finalized state,
+                // which can overflow its listener buffer and get the stream dropped on every
+                // (re)subscription; see
+                // <https://github.com/ZcashFoundation/zebra/issues/11265>.
+                self.catch_up_to_tip().await;
+
                 non_finalized_blocks_listener = match self
                     .subscribe_to_non_finalized_state_change()
                     .await
                 {
-                    Ok(listener) => Some(listener),
+                    Ok(listener) => {
+                        stream_subscribed_at = Some(tokio::time::Instant::now());
+                        Some(listener)
+                    }
                     Err(err) => {
                         tracing::warn!(?err, "failed to subscribe to non-finalized state changes");
-                        tokio::time::sleep(POLL_DELAY).await;
                         None
                     }
                 };
@@ -324,14 +382,6 @@ impl TrustedChainSync {
                 non_finalized_blocks_listener = None;
                 continue;
             };
-
-            // We have a parseable block from the stream, so take over the finalized tip: stop
-            // `update_finalized_chain_tip` so it no longer catches up the shared secondary db
-            // concurrently with our commits below.
-            if !signalled_started {
-                self.started_sync_sender.send_replace(true);
-                signalled_started = true;
-            }
 
             if self.non_finalized_state.any_chain_contains(&hash) {
                 // Expected and harmless: on a resumed or multi-chain stream the server can re-send a
@@ -424,6 +474,19 @@ impl TrustedChainSync {
             self.prune_finalized();
         }
 
+        // Take over the finalized tip on the first successful commit: stop
+        // `update_finalized_chain_tip` so it no longer catches up the shared secondary db
+        // concurrently with our commits, and no longer overwrites the non-finalized tip we
+        // publish below with its lagging finalized tip. Flipping here rather than on the first
+        // received message keeps that fallback alive while the stream fails before any block
+        // can be committed, so the published tip keeps following the finalized tip instead of
+        // freezing; see <https://github.com/ZcashFoundation/zebra/issues/11265>.
+        self.started_sync_sender.send_if_modified(|started| {
+            let newly_started = !*started;
+            *started = true;
+            newly_started
+        });
+
         self.update_channels();
 
         Ok(())
@@ -493,6 +556,74 @@ impl TrustedChainSync {
         }
     }
 
+    /// Fetches and commits best-chain blocks above our current tip from the primary via unary
+    /// [`Self::get_block`] calls, until the primary's best tip is reached (`get_block` returns
+    /// `NotFound` for the height above it).
+    ///
+    /// Called before every `non_finalized_state_change` (re)subscription so the subscription
+    /// request carries our actual chain tips and the server's initial send is limited to blocks
+    /// we don't already have (typically only side-chain blocks). Otherwise a subscription with an
+    /// empty non-finalized state makes the server send its entire non-finalized state — up to
+    /// `MAX_NON_FINALIZED_CHAIN_FORKS` chains of up to `MAX_BLOCK_REORG_HEIGHT` blocks each —
+    /// which can overflow the server's listener buffer and get the stream dropped before we can
+    /// catch up, on every (re)subscription; see
+    /// <https://github.com/ZcashFoundation/zebra/issues/11265>.
+    ///
+    /// This is best-effort, like [`Self::fill_finalized_gap`]: if a block can't be fetched or
+    /// committed, it returns and lets the stream path recover. Blocks committed by the server
+    /// after our last `get_block` are simply delivered by the subscription as usual.
+    async fn catch_up_to_tip(&mut self) {
+        loop {
+            // Advance the secondary's finalized state first and drop any of our blocks it has
+            // since finalized, so the next height is computed from where we actually are.
+            self.try_catch_up_with_primary().await;
+            self.prune_finalized();
+
+            // The next height to fetch is just above the highest block we already have: the
+            // non-finalized best tip if we have one, otherwise the finalized tip.
+            let Some(highest) = self
+                .non_finalized_state
+                .best_tip()
+                .map(|(height, _hash)| height)
+                .max(self.db.finalized_tip_height())
+            else {
+                return;
+            };
+
+            let Ok(next_height) = highest.next() else {
+                return;
+            };
+
+            let (block, hash) = match self.get_block(next_height.into()).await {
+                Ok(block_and_hash) => block_and_hash,
+                Err(status) if status.code() == tonic::Code::NotFound => {
+                    // We've reached the primary's best tip.
+                    return;
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        ?error,
+                        ?next_height,
+                        "failed to fetch a block while catching up to the primary's best tip; \
+                         continuing with the subscription"
+                    );
+                    return;
+                }
+            };
+
+            let block = SemanticallyVerifiedBlock::with_hash(Arc::new(block), hash);
+            if let Err(error) = self.commit(block) {
+                tracing::debug!(
+                    ?error,
+                    ?next_height,
+                    "failed to commit a block while catching up to the primary's best tip; \
+                     continuing with the subscription"
+                );
+                return;
+            }
+        }
+    }
+
     /// Fetches a single block from the primary by hash or height via the indexer gRPC.
     async fn get_block(
         &self,
@@ -525,7 +656,8 @@ impl TrustedChainSync {
     /// Passes the tip hashes of every chain currently in this syncer's non-finalized state so the
     /// server only streams blocks after the tips we already have, instead of re-sending the whole
     /// non-finalized state on every (re)subscription. When the non-finalized state is empty, the
-    /// request carries no tips and the server streams every non-finalized block.
+    /// request carries no tips and the server streams every non-finalized block — which is why
+    /// [`Self::catch_up_to_tip`] runs before every call to this method.
     async fn subscribe_to_non_finalized_state_change(
         &mut self,
     ) -> Result<Streaming<BlockAndHash>, Status> {
